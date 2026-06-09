@@ -11,20 +11,24 @@ import matplotlib.pyplot as plt
 xml_path   = 'free_floating_2DFK.xml'   # same folder as this script
 simend     = 20.0                        # simulation duration [s]
 print_camera_config = 0
-
+ee_site_id = -1
 # ─────────────────────────────────────────────
-#  DESIRED JOINT ANGLES  (joint1, joint2, joint3)
+#  DESIRED End-Effector position (ee_x, ee_y)
 #  Change these to any target configuration you want
 # ─────────────────────────────────────────────
-q_desired = np.array([np.pi/4,          # joint1  [rad]
-                       -np.pi/3,        # joint2  [rad]
-                        np.pi/6])       # joint3  [rad]
 
-# q_desired = np.array([
-#     np.deg2rad(30.0),
-#     0.0,
-#     0.0
+# x_desired = np.array([
+#     1.20,
+#     0.30
 # ])
+
+x_desired = np.array([
+    0.6,
+    0.3
+])
+
+current_tau = np.zeros(3)
+current_force = np.zeros(2)
 # ─────────────────────────────────────────────
 #  PID GAINS  (one row per joint: [Kp, Ki, Kd])
 #  Tune these to get the response you want.
@@ -32,10 +36,20 @@ q_desired = np.array([np.pi/4,          # joint1  [rad]
 #  in zero-gravity
 # ─────────────────────────────────────────────
 
-# Start with PD only
-Kp = np.array([5.0, 5.0, 5.0])
-Ki = np.array([0.0, 0.0, 0.0])
-Kd = np.array([2.0, 2.0, 2.0])
+
+ # ==================================================
+ # Cartesian PD Gains
+ # ==================================================
+
+Kp_cart = np.array([
+        [20.0, 0.0],
+        [0.0, 20.0]
+    ])
+
+Kd_cart = np.array([
+        [8.0, 0.0],
+        [0.0, 8.0]
+    ])
 
 # Actuator output saturation  [Nm]
 TORQUE_LIMIT = 5.0
@@ -69,6 +83,18 @@ def init_controller(model, data):
     """Called once before the sim loop — resolves all joint/actuator indices by name."""
     global integral_error, prev_error, prev_time
     global jnt_qposadr, jnt_dofadr, act_id
+    global ee_site_id
+
+    ee_site_id = mj.mj_name2id(
+        model,
+        mj.mjtObj.mjOBJ_SITE,
+        "ee_site"
+    )
+
+    if ee_site_id == -1:
+        raise RuntimeError(
+            "Site 'ee_site' not found."
+        )
 
     integral_error[:] = 0.0
     prev_error[:]     = 0.0
@@ -96,60 +122,150 @@ def init_controller(model, data):
     print("=" * 55)
     print("  Free-Floating SMS  —  PID Joint Controller")
     print("=" * 55)
-    print(f"  Target joints : {np.degrees(q_desired).round(1)} deg")
-    print(f"  Kp = {Kp}  Ki = {Ki}  Kd = {Kd}")
+    print(f"  Target EE Position : {x_desired}")
+    print(f"  Kp_cart =\n{Kp_cart}")
+    print(f"  Kd_cart =\n{Kd_cart}")
     print(f"  Torque limit  : ±{TORQUE_LIMIT} Nm")
     print(f"  qpos addresses : joint1={jnt_qposadr[0]}  joint2={jnt_qposadr[1]}  joint3={jnt_qposadr[2]}")
     print(f"  qvel addresses : joint1={jnt_dofadr[0]}   joint2={jnt_dofadr[1]}   joint3={jnt_dofadr[2]}")
     print(f"  ctrl indices   : {act_id}")
     print("=" * 55)
 
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+
+    site_id = mj.mj_name2id(
+        model,
+        mj.mjtObj.mjOBJ_SITE,
+        "ee_site"
+    )
+
+    mj.mj_jacSite(
+        model,
+        data,
+        jacp,
+        jacr,
+        site_id
+    )
+
+    print("\nJacobian Shape =", jacp.shape)
+    print(jacp)
+
 # ═════════════════════════════════════════════
 #  PID CONTROLLER  (called every step by MuJoCo)
 # ═════════════════════════════════════════════
 def controller(model, data):
-    """
-    Torque-level PID on the three manipulator joints.
-    Uses MuJoCo-resolved qpos/qvel addresses — never hardcoded indices.
-    """
-    global integral_error, prev_error, prev_time
+
+    global prev_time
+    global current_tau
+    global current_force
 
     dt = data.time - prev_time[0]
+
     if dt <= 0.0:
         return
 
-    # ── Read current joint angles & velocities via resolved addresses ──
-    q_current = np.array([data.qpos[jnt_qposadr[i]] for i in range(3)])
-    q_dot     = np.array([data.qvel[jnt_dofadr[i]]  for i in range(3)])
 
-    # ── PID error ─────────────────────────────────
-    error = q_desired - q_current
+    # ==================================================
+    # Current End-Effector Position
+    # ==================================================
 
-    # Wrap angle error to [-π, π]
-    error = (error + np.pi) % (2 * np.pi) - np.pi
+    ee = data.site("ee_site").xpos
 
-    # Integral with anti-windup
-    integral_error += error * dt
-    integral_error  = np.clip(integral_error, -10.0, 10.0)
+    x_current = np.array([
+        ee[0],
+        ee[1]
+    ])
 
-    # Derivative: use measured velocity (no derivative kick)
-    derivative = -q_dot
+    # ==================================================
+    # Cartesian Position Error
+    # ==================================================
 
-    # ── Compute torques ────────────────────────────
-    tau = Kp * error + Ki * integral_error + Kd * derivative
-    tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
-    global tau1_history
-    global tau2_history
-    global tau3_history
+    pos_error = x_desired - x_current
+
+    # ==================================================
+    # Jacobian
+    # ==================================================
+
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+
+    site_id = mj.mj_name2id(
+        model,
+        mj.mjtObj.mjOBJ_SITE,
+        "ee_site"
+    )
+
+    mj.mj_jacSite(
+        model,
+        data,
+        jacp,
+        jacr,
+        site_id
+    )
+
+    # ==================================================
+    # End-Effector Velocity
+    # ==================================================
+
+    ee_vel = jacp @ data.qvel
+
+    vel_xy = np.array([
+        ee_vel[0],
+        ee_vel[1]
+    ])
+
+
+    # ==================================================
+    # Cartesian PD Force
+    # ==================================================
+
+    F_task = (
+        Kp_cart @ pos_error
+        -
+        Kd_cart @ vel_xy
+    )
+
+    current_force[:] = F_task
+
+    # ==================================================
+    # Jacobian Transpose Mapping
+    # ==================================================
+
+    J_xy = jacp[0:2, :]
+
+    tau_full = J_xy.T @ F_task
+
+    # ==================================================
+    # Extract Manipulator Torques
+    # ==================================================
+
+    tau = np.array([
+        tau_full[jnt_dofadr[0]],
+        tau_full[jnt_dofadr[1]],
+        tau_full[jnt_dofadr[2]]
+    ])
+
+    # ==================================================
+    # Torque Saturation
+    # ==================================================
+
+    tau = np.clip(
+        tau,
+        -TORQUE_LIMIT,
+        TORQUE_LIMIT
+    )
 
     current_tau[:] = tau
 
-    # ── Apply to actuators via resolved ctrl indices ──
+    # ==================================================
+    # Apply Torques
+    # ==================================================
+
     for i in range(3):
         data.ctrl[act_id[i]] = tau[i]
 
-    prev_error[:]  = error
-    prev_time[0]   = data.time
+    prev_time[0] = data.time
 
 # ═════════════════════════════════════════════
 #  GLFW CALLBACKS
@@ -204,28 +320,6 @@ data  = mj.MjData(model)
 cam   = mj.MjvCamera()
 opt   = mj.MjvOption()
 
-# ## Test 
-# print("\nJOINTS")
-# for i in range(model.njnt):
-#     print(
-#         i,
-#         mj.mj_id2name(
-#             model,
-#             mj.mjtObj.mjOBJ_JOINT,
-#             i
-#         )
-#     )
-
-# print("\nACTUATORS")
-# for i in range(model.nu):
-#     print(
-#         i,
-#         mj.mj_id2name(
-#             model,
-#             mj.mjtObj.mjOBJ_ACTUATOR,
-#             i
-#         )
-#     )
 
 # ─── GLFW window ──────────────────────────────
 glfw.init()
@@ -269,7 +363,7 @@ next_log     = 0.0
 #  Video Writing
 # ═════════════════════════════════════════════
 video_writer = imageio.get_writer(
-    "PID_FreeFloating_SMS_JointSpace_control.mp4",
+    "PID_FreeFloating_SMS.mp4",
     fps=60
 )
 # ═════════════════════════════════════════════
@@ -277,14 +371,15 @@ video_writer = imageio.get_writer(
 # ═════════════════════════════════════════════
 time_history = []
 
-q1_history = []
-q2_history = []
-q3_history = []
+ex_history = []
+ey_history = []
 
 tau1_history = []
 tau2_history = []
 tau3_history = []
 
+Fx_history = []
+Fy_history = []
 current_tau = np.zeros(3)
 
 base_x_history = []
@@ -308,24 +403,17 @@ while not glfw.window_should_close(window):
         tau1_history.append(current_tau[0])
         tau2_history.append(current_tau[1])
         tau3_history.append(current_tau[2])
+        ee = data.site("ee_site").xpos
 
-        q1_history.append(
-            np.rad2deg(
-                data.qpos[jnt_qposadr[0]]
-            )
-        )
+        ee_current = ee[:2]
 
-        q2_history.append(
-            np.rad2deg(
-                data.qpos[jnt_qposadr[1]]
-            )
-        )
+        error = x_desired - ee_current  
 
-        q3_history.append(
-            np.rad2deg(
-                data.qpos[jnt_qposadr[2]]
-            )
-        )
+        ex_history.append(error[0])
+        ey_history.append(error[1])
+
+        Fx_history.append(current_force[0])
+        Fy_history.append(current_force[1])
 
         base_x_history.append(
             data.qpos[0]
@@ -348,20 +436,21 @@ while not glfw.window_should_close(window):
 
     # ── Console log ───────────────────────────
     if data.time >= next_log:
-        q_cur = np.array([data.qpos[jnt_qposadr[i]] for i in range(3)])
-        qd    = np.degrees(q_desired)
-        qc    = np.degrees(q_cur)
-        err   = np.degrees(q_desired - q_cur)
-        ee    = data.site("ee_site").xpos
-        base_xy = data.qpos[0:2]
-        print(f"t={data.time:6.2f}s | "
-              f"q_des={qd[0]:6.1f} {qd[1]:6.1f} {qd[2]:6.1f} deg | "
-              f"q_cur={qc[0]:6.1f} {qc[1]:6.1f} {qc[2]:6.1f} deg | "
-              f"err={err[0]:5.1f} {err[1]:5.1f} {err[2]:5.1f} deg | "
-              f"EE=({ee[0]:.3f},{ee[1]:.3f}) | "
-              f"base=({base_xy[0]:.3f},{base_xy[1]:.3f})")
-        next_log += log_interval
 
+        ee = data.site("ee_site").xpos
+
+        err = x_desired - ee[:2]
+
+        base_xy = data.qpos[0:2]
+
+        print(
+            f"t={data.time:6.2f}s | "
+            f"EE=({ee[0]:.3f},{ee[1]:.3f}) | "
+            f"Err=({err[0]:.3f},{err[1]:.3f}) | "
+            f"Base=({base_xy[0]:.3f},{base_xy[1]:.3f})"
+        )
+
+        next_log += log_interval
     if data.time >= simend:
         print("\n[SIM] Reached simend. Close window to exit.")
         break
@@ -403,51 +492,39 @@ video_writer.close()
 
 print("Video saved successfully.")
 
-## Joint angle plots ##
+## EE Error plots ##
 plt.figure(figsize=(10,6))
 
-plt.plot(time_history,
-         q1_history,
-         label='Joint 1')
+plt.plot(
+    time_history,
+    ex_history,
+    label='X Error'
+)
 
-plt.plot(time_history,
-         q2_history,
-         label='Joint 2')
-
-plt.plot(time_history,
-         q3_history,
-         label='Joint 3')
-
-# Desired references
-q_des_deg = np.rad2deg(q_desired)
-
-colors = ['tab:blue', 'tab:orange', 'tab:green']
-
-for i in range(3):
-    plt.axhline(
-        q_des_deg[i],
-        color=colors[i],
-        linestyle='--',
-        linewidth=2,
-        label=f'Desired Joint {i+1}'
-    )
+plt.plot(
+    time_history,
+    ey_history,
+    label='Y Error'
+)
 
 plt.xlabel('Time [s]')
-plt.ylabel('Angle [deg]')
-plt.title('Joint Angle Response')
+plt.ylabel('Error [m]')
+
+plt.title(
+    'Cartesian Tracking Error'
+)
 
 plt.grid(True)
 plt.legend()
 
 plt.savefig(
-    'Joint_Angles_JointSpace_control.png',
+    'Cartesian_Error.png',
     dpi=300,
     bbox_inches='tight'
 )
 
 
 ## Torque Plots ##
-
 n = min(len(time_history),
         len(tau1_history))
 plt.figure(figsize=(10,6))
@@ -479,7 +556,7 @@ plt.grid(True)
 plt.legend()
 
 plt.savefig(
-    'Control_Torque_JointSpace_control.png',
+    'Control_Torque.png',
     dpi=300,
     bbox_inches='tight'
 )
@@ -501,12 +578,11 @@ plt.title('Spacecraft Base Reaction Motion')
 plt.grid(True)
 
 plt.savefig(
-    'Base_Reaction_JointSpace_control.png',
+    'Base_Reaction_Cartesian_control.png',
     dpi=300,
     bbox_inches='tight'
 )
 
-plt.show()
 
 ## End-effector Trajectory plot ##
 plt.figure(figsize=(7,7))
@@ -533,6 +609,13 @@ plt.scatter(
     label='End'
 )
 
+plt.scatter(
+    x_desired[0],
+    x_desired[1],
+    marker='x',
+    s=250,
+    label='Target'
+)
 plt.xlabel('X [m]')
 plt.ylabel('Y [m]')
 
@@ -546,10 +629,41 @@ plt.grid(True)
 plt.legend()
 
 plt.savefig(
-    'EE_Trajectory_JointSpace_control.png',
+    'EE_Trajectory_Cartesian_control.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+
+## Cartesian Force Plots
+plt.figure(figsize=(10,6))
+
+plt.plot(
+    time_history,
+    Fx_history,
+    label='Fx'
+)
+
+plt.plot(
+    time_history,
+    Fy_history,
+    label='Fy'
+)
+
+plt.xlabel('Time [s]')
+plt.ylabel('Force')
+
+plt.title(
+    'Cartesian Control Force'
+)
+
+plt.grid(True)
+plt.legend()
+
+plt.savefig(
+    'Cartesian_Force.png',
     dpi=300,
     bbox_inches='tight'
 )
 
 plt.show()
-
